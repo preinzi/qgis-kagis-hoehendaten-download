@@ -69,6 +69,30 @@ def fetch_json(url):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def bbox_overlap(a, b):
+    """True, wenn sich zwei (west, sued, ost, nord)-Boxen ueberschneiden."""
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+def raster_extent(path):
+    """Liest die tatsaechliche Ausdehnung einer heruntergeladenen Kachel
+    direkt aus ihrer eigenen Georeferenzierung (nicht aus STAC-Metadaten) -
+    das ist die einzige Quelle, die KAGIS nicht versehentlich falsch
+    angeben kann, da sie aus den Pixeldaten selbst kommt."""
+    try:
+        ds = gdal.Open(path)
+        if ds is None:
+            return None
+        gt = ds.GetGeoTransform()
+        xsize, ysize = ds.RasterXSize, ds.RasterYSize
+        ds = None
+    except Exception:
+        return None
+    xs = (gt[0], gt[0] + xsize * gt[1] + ysize * gt[2])
+    ys = (gt[3], gt[3] + xsize * gt[4] + ysize * gt[5])
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
 def list_collections(feedback=None):
     url = urljoin(API_ROOT, "collections")
     try:
@@ -222,6 +246,14 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
         extent = self.parameterAsExtent(
             parameters, self.EXTENT, context, QgsCoordinateReferenceSystem("EPSG:4326"))
         aoi_bbox = (extent.xMinimum(), extent.yMinimum(), extent.xMaximum(), extent.yMaximum())
+        feedback.pushInfo(
+            f"AOI in EPSG:4326: west={aoi_bbox[0]:.6f}, sued={aoi_bbox[1]:.6f}, "
+            f"ost={aoi_bbox[2]:.6f}, nord={aoi_bbox[3]:.6f}")
+
+        extent_native = self.parameterAsExtent(
+            parameters, self.EXTENT, context, QgsCoordinateReferenceSystem(KAGIS_SOURCE_CRS))
+        aoi_bbox_native = (extent_native.xMinimum(), extent_native.yMinimum(),
+                            extent_native.xMaximum(), extent_native.yMaximum())
         out_root = self.parameterAsString(parameters, self.OUTPUT_FOLDER, context)
         group_names = [list(COLLECTION_GROUPS.keys())[i]
                         for i in self.parameterAsEnums(parameters, self.GROUPS_PARAM, context)]
@@ -265,6 +297,18 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
             all_items = []
             for cid in matched:
                 items = search_items(cid, aoi_bbox, feedback=feedback)
+                # Sicherheitsnetz: die von der API zurueckgegebenen Items
+                # lokal nochmal gegen die AOI pruefen, statt der
+                # serverseitigen bbox-Filterung blind zu vertrauen (die kann
+                # z.B. bei Pagination Parameter verlieren).
+                before = len(items)
+                items = [it for it in items
+                         if bbox_overlap(tuple((it.get("bbox") or list(aoi_bbox))[:4]), aoi_bbox)]
+                dropped = before - len(items)
+                if dropped:
+                    feedback.pushWarning(
+                        f"  {cid}: {dropped} von {before} Items lagen laut API-Antwort "
+                        "ausserhalb der AOI - lokal herausgefiltert.")
                 feedback.pushInfo(f"  {cid}: {len(items)} Item(s) in der AOI")
                 all_items.extend(items)
 
@@ -306,6 +350,51 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
                     feedback.pushWarning(
                         f"{label}: keine Assets mit Schluessel-Filter {asset_filter} gefunden "
                         f"(siehe Asset-Schluessel oben - Filter ggf. anpassen).")
+                    continue
+
+                # Letzte, unabhaengige Pruefung: die tatsaechliche
+                # Georeferenzierung jeder heruntergeladenen Kachel gegen die
+                # AOI checken - falls KAGIS' eigene STAC-bbox-Angabe fuer eine
+                # Collection fehlerhaft ist (z.B. Collection- statt
+                # Item-Ausdehnung), faellt das hier auf, weil wir uns auf
+                # gar keine Metadaten mehr verlassen, sondern auf die echten
+                # Pixel-Header der heruntergeladenen Datei.
+                verified = []
+                off_target = []
+                unreadable = []
+                for path in downloaded:
+                    ext = raster_extent(path)
+                    if ext is None:
+                        unreadable.append(path)
+                    elif bbox_overlap(ext, aoi_bbox_native):
+                        verified.append(path)
+                    else:
+                        off_target.append(path)
+
+                if unreadable:
+                    names = ", ".join(os.path.basename(p) for p in unreadable[:5])
+                    more = f" (+{len(unreadable) - 5} weitere)" if len(unreadable) > 5 else ""
+                    feedback.pushWarning(
+                        f"{label}: {len(unreadable)} heruntergeladene Datei(en) liessen sich "
+                        f"nicht als Raster oeffnen (moeglicherweise beschaedigt) - aus dem "
+                        f"Mosaik ausgeschlossen, aber NICHT geloescht, zur manuellen Pruefung: {names}{more}")
+
+                if off_target:
+                    names = ", ".join(os.path.basename(p) for p in off_target[:5])
+                    more = f" (+{len(off_target) - 5} weitere)" if len(off_target) > 5 else ""
+                    feedback.pushWarning(
+                        f"{label}: {len(off_target)} heruntergeladene Kachel(n) liegen laut "
+                        "ihrer EIGENEN Georeferenzierung tatsaechlich ausserhalb der AOI "
+                        f"(KAGIS-Katalogmetadaten waren fehlerhaft) - geloescht: {names}{more}")
+                    for p in off_target:
+                        try:
+                            os.remove(p)
+                        except OSError as e:
+                            feedback.pushWarning(f"{label}: konnte {os.path.basename(p)} nicht loeschen: {e}")
+
+                downloaded = verified
+                if not downloaded:
+                    feedback.pushWarning(f"{label}: nach Extent-Pruefung keine Kacheln mehr uebrig.")
                     continue
 
                 vrt_path = os.path.join(out_dir, f"{label}_mosaic.vrt")
