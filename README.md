@@ -4,6 +4,8 @@ A QGIS Processing script that bulk-downloads elevation raster tiles (DGM/DOM/DOL
 
 > **Note:** The tool's interface (parameter labels, log messages, help text) is in German, matching its target audience and the German-language KAGIS data catalog it queries. This README is in English for discoverability.
 
+<img src="images/screenshot.png" width="400" alt="Screenshot of the tool in QGIS">
+
 ## What it does
 
 Given an area of interest, this tool:
@@ -30,11 +32,11 @@ No extra Python packages required beyond what ships with QGIS (uses only the Pyt
 
 | Parameter | Description |
 |---|---|
-| **Gebiet (AOI)** | Area of interest — draw a rectangle or use the current canvas extent |
+| **Gebiet (AOI)** | Area of interest — draw a rectangle, use the current canvas extent or calculate extent from a layer |
 | **ALS-Zyklen** | Which survey cycle(s) to fetch: ALS1, ALS2, or both |
 | **Modelltyp(en)** | Which elevation model(s) to fetch: DGM, DOM, and/or DOL |
 | **Ziel-CRS** | Optional. Leave empty to keep the source CRS (EPSG:31258); pick a CRS to get an additional, virtually reprojected VRT |
-| **Zielordner** | Where downloaded tiles and mosaics are stored. Use a persistent folder, not the default temp location — results should stay usable after the QGIS session ends, and a later run over an overlapping area reuses already-downloaded tiles instead of re-fetching them |
+| **Zielordner** | Where downloaded tiles and mosaics are stored. It is recommended to use a persistent folder, not the default temp location — results should stay usable after the QGIS session ends, and a later run over an overlapping area reuses already-downloaded tiles instead of re-fetching them |
 
 ### Output layers
 
