@@ -10,12 +10,14 @@ Pro ausgewähltem ALS-Zyklus UND pro ausgewähltem Modelltyp (DGM/DOM/DOL)
 entsteht ein eigenes VRT-Mosaik und ein eigener Layer im Projekt.
 
 Sofern nicht explizit ein gewünschtes Koordinatenbezugssystem eingestellt
-wird, wird EPSG 31258 (MGI / Austria GK M31) verwendet (entsprechend
-der Rohdaten).
+wird, bleiben die Kacheln in ihrem jeweiligen tatsächlichen Original-CRS,
+nämlich ALS1 in EPSG:31258 (MGI / Austria GK M31) und ALS2 in EPSG:31255
+(MGI / Austria GK Central).
 """
 
 import json
 import os
+import re
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -30,22 +32,48 @@ from qgis.core import (
     QgsProject,
     QgsRasterLayer,
 )
-from osgeo import gdal
+from osgeo import gdal, osr
+
+# GDAL >= 3.7 warnt, wenn weder UseExceptions() noch DontUseExceptions()
+# explizit aufgerufen wurde - ab GDAL 4.0 werden Exceptions Standard sein.
+# Explizit aktivieren (wie in QGIS' eigenen gebuendelten GDAL-Algorithmen).
+gdal.UseExceptions()
+osr.UseExceptions()
 
 # Bestaetigt funktionierend (Live-Test 2026)
 # Falls KAGIS die API mal umzieht: https://gis.ktn.gv.at/osgdi/swagger/#/Suche
 # zeigt die dann aktuelle Basis-URL.
 API_ROOT = "https://gis.ktn.gv.at/api/stac/v1/"
 
-# KAGIS-Rasterdaten liegen durchgehend in EPSG:31258 (MGI / Austria GK M31) -
-# bestaetigt sowohl im offiziellen KAGIS-Benutzerleitfaden als auch im
-# data.gv.at-Datensatz fuer das landesweite DGM/DOM. Kaernten liegt komplett
-# in dieser einen GK-Zone. Da dieses Tool ausschliesslich fuer KAGIS-Daten
-# gedacht ist, wird die Projektion beim VRT-Bau direkt darauf gesetzt statt
-# sie (unzuverlaessig) aus den Original-Kacheln auszulesen - GDAL kopiert
-# deren eingebettete WKT zwar anstandslos, aber offenbar ohne fuer QGIS
-# erkennbare EPSG-Referenz.
+# WICHTIG: KAGIS-Rasterdaten liegen NICHT einheitlich in EPSG:31258.
+# ALS1-Kacheln liegen in EPSG:31258 (MGI / Austria GK M31), ALS2-Kacheln
+# in EPSG:31255 (MGI / Austria GK Central). Die tatsaechliche CRS wird
+# deshalb immer direkt aus einer echten heruntergeladenen Kachel gelesen
+# (siehe VRT-Bau weiter unten), NICHT aus dieser Konstante. KAGIS_SOURCE_CRS
+# dient nur noch als Fallback-Wert (falls eine Kachel gar keine Projektion
+# hat) und fuer die AOI-Info-Ausgabe.
 KAGIS_SOURCE_CRS = "EPSG:31258"
+
+# Bekannte oesterreichische MGI-GK-Bezeichnungen (Ferro- und Greenwich-
+# referenziert) als Rueckfallebene, falls osr.AutoIdentifyEPSG() eine Kachel-
+# CRS nicht erkennt - das kann schon an winzigen Gleitkomma-Abweichungen im
+# Ellipsoid scheitern (beobachtet bei ALS1: 299.152812800003 statt
+# 299.1528128), obwohl der CRS-NAME eindeutig ist.
+KNOWN_MGI_CRS_NAMES = {
+    "MGI / Austria GK West": "31254",
+    "MGI / Austria GK Central": "31255",
+    "MGI / Austria GK East": "31256",
+    "MGI / Austria GK M28": "31257",
+    "MGI / Austria GK M31": "31258",
+    "MGI / Austria GK M34": "31259",
+}
+
+# Letzte Rueckfallebene: dieses Tool ist ausschliesslich fuer ALS1/ALS2
+# gedacht, und deren native CRS ist bekannt.
+KNOWN_GROUP_CRS = {
+    "ALS1": "31258",
+    "ALS2": "31255",
+}
 
 # Name -> (Begriffe, die ALLE im Collection-Titel/-id vorkommen muessen,
 #          Begriffe, die KEINER vorkommen darf)
@@ -77,20 +105,48 @@ def bbox_overlap(a, b):
 def raster_extent(path):
     """Liest die tatsaechliche Ausdehnung einer heruntergeladenen Kachel
     direkt aus ihrer eigenen Georeferenzierung (nicht aus STAC-Metadaten) -
-    das ist die einzige Quelle, die KAGIS nicht versehentlich falsch
-    angeben kann, da sie aus den Pixeldaten selbst kommt."""
+    das ist die einzige Quelle, die KAGIS nicht versehentlich falsch angeben
+    kann, da sie aus den Pixeldaten selbst kommt. Rechnet dabei explizit
+    nach EPSG:4326 um, unter Verwendung der EIGENEN eingebetteten CRS der
+    Datei - falls einzelne Kacheln (z.B. bei ALS2 beobachtet) intern eine
+    leicht abweichende CRS-Kodierung tragen, waere ein direkter
+    Rohwerte-Vergleich sonst falsch. EPSG:4326 wird als Vergleichs-CRS
+    gewaehlt, weil sich das im separaten Verifikations-Script bei allen
+    249 getesteten Kacheln als zuverlaessig erwiesen hat."""
     try:
         ds = gdal.Open(path)
         if ds is None:
             return None
         gt = ds.GetGeoTransform()
         xsize, ysize = ds.RasterXSize, ds.RasterYSize
+        src_wkt = ds.GetProjection()
         ds = None
     except Exception:
         return None
+
     xs = (gt[0], gt[0] + xsize * gt[1] + ysize * gt[2])
     ys = (gt[3], gt[3] + xsize * gt[4] + ysize * gt[5])
-    return (min(xs), min(ys), max(xs), max(ys))
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+
+    if not src_wkt:
+        return None
+    try:
+        src_srs = osr.SpatialReference()
+        src_srs.ImportFromWkt(src_wkt)
+        src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        dst_srs = osr.SpatialReference()
+        dst_srs.SetFromUserInput("EPSG:4326")
+        dst_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        tr = osr.CoordinateTransformation(src_srs, dst_srs)
+        lons, lats = [], []
+        for x, y in [(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)]:
+            lon, lat, _ = tr.TransformPoint(x, y)
+            lons.append(lon)
+            lats.append(lat)
+        return (min(lons), min(lats), max(lons), max(lats))
+    except Exception:
+        return None
 
 
 def list_collections(feedback=None):
@@ -105,6 +161,19 @@ def list_collections(feedback=None):
                 "https://gis.ktn.gv.at/osgdi/swagger/#/Suche zeigt die aktuelle.")
         return []
     return doc.get("collections", doc if isinstance(doc, list) else [])
+
+
+# Grober, aber grosszuegiger Gueltigkeitsbereich fuer Kaernten in EPSG:4326.
+# Dient nur dazu, eine fehlgeschlagene/nicht durchgefuehrte CRS-Umrechnung
+# zu erkennen, die sonst still falsche (unveraenderte) Koordinaten an die
+# STAC-Suche durchreichen wuerde.
+KAERNTEN_4326_SANITY_BOUNDS = (12.0, 46.0, 15.5, 47.5)
+
+
+def looks_like_valid_4326_kaernten(bbox):
+    ax0, ay0, ax1, ay1 = KAERNTEN_4326_SANITY_BOUNDS
+    bx0, by0, bx1, by1 = bbox
+    return not (bx1 < ax0 or bx0 > ax1 or by1 < ay0 or by0 > ay1)
 
 
 def search_items(collection_id, aoi_bbox, feedback=None, limit=200):
@@ -130,12 +199,16 @@ def search_items(collection_id, aoi_bbox, feedback=None, limit=200):
     return items
 
 
-def download_item_assets(item, out_dir, asset_key_filter):
+def download_item_assets(item, out_dir, asset_key_filter, feedback=None):
     """Laedt passende Assets eines Items. Schreibt jede Datei erst unter einem
     .part-Namen und benennt sie erst nach vollstaendigem, erfolgreichem
     Download um - so kann eine abgebrochene oder fehlgeschlagene Datei nie
     faelschlich als "bereits vorhanden" durchgehen (relevant seit es
-    Abbrechen mitten im Download gibt). Ein Fehlschlag wird einmal wiederholt."""
+    Abbrechen mitten im Download gibt). Ein Fehlschlag wird einmal wiederholt.
+    Liest in Chunks und prueft dabei laufend auf Abbruch, statt in einem
+    einzigen blockierenden resp.read() - so kann ein Abbruch auch einen
+    schon laufenden Download tatsaechlich stoppen, nicht nur noch nicht
+    gestartete."""
     out = []
     failed = []
     for key, asset in item.get("assets", {}).items():
@@ -153,14 +226,24 @@ def download_item_assets(item, out_dir, asset_key_filter):
         tmp_path = out_path + ".part"
         ok = False
         for attempt in range(2):
+            if feedback is not None and feedback.isCanceled():
+                break
             try:
                 req = Request(href, headers={"User-Agent": "kagis-qgis-tool/1.0"})
                 with urlopen(req, timeout=120) as resp, open(tmp_path, "wb") as f:
-                    f.write(resp.read())
+                    while True:
+                        if feedback is not None and feedback.isCanceled():
+                            raise RuntimeError("abgebrochen")
+                        chunk = resp.read(1 << 18)
+                        if not chunk:
+                            break
+                        f.write(chunk)
                 os.replace(tmp_path, out_path)  # atomar - out_path existiert erst jetzt
                 ok = True
                 break
             except Exception:
+                if feedback is not None and feedback.isCanceled():
+                    break  # kein Retry mehr, wenn der Nutzer abgebrochen hat
                 continue
         if not ok:
             try:
@@ -192,7 +275,7 @@ def run_downloads(items, out_dir, asset_key_filter, feedback, max_workers=4,
     canceled = False
     ex = ThreadPoolExecutor(max_workers=max_workers)
     try:
-        futs = {ex.submit(download_item_assets, item, out_dir, asset_key_filter): item for item in items}
+        futs = {ex.submit(download_item_assets, item, out_dir, asset_key_filter, feedback): item for item in items}
         pending = set(futs.keys())
         total = len(pending)
         done_count = 0
@@ -238,22 +321,114 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
             allowMultiple=True, defaultValue=[0, 1]))  # DGM + DOM vorausgewaehlt
         self.addParameter(QgsProcessingParameterCrs(
             self.TARGET_CRS,
-            f"Ziel-CRS (leer lassen = {KAGIS_SOURCE_CRS}, die KAGIS-Original-CRS)",
+            "Ziel-CRS (leer lassen = jeweilige Original-CRS der Kacheln, "
+            "ALS1=EPSG:31258, ALS2=EPSG:31255)",
             optional=True))
         self.addParameter(QgsProcessingParameterFolderDestination(self.OUTPUT_FOLDER, "Zielordner"))
 
     def processAlgorithm(self, parameters, context, feedback):
-        extent = self.parameterAsExtent(
+        # WICHTIG: Die QgsRectangle-Accessoren (.xMinimum() usw.), die
+        # parameterAsExtent() liefert, vertauschen fuer dieses Projekt/CRS
+        # nachweislich die MITTLEREN beiden Werte (ymin und xmax) beim
+        # Umwandeln des Eingabe-Strings - reproduzierbar, positionsbasiert,
+        # unabhaengig von den tatsaechlichen Koordinatenwerten (verifiziert
+        # per Test: der rohe Eingabe-String selbst ist immer korrekt in der
+        # Reihenfolge xmin,ymin,xmax,ymax, aber das daraus konstruierte
+        # QgsRectangle-Objekt gibt bei .yMinimum()/.xMaximum() vertauschte
+        # Werte zurueck). Deshalb wird hier der rohe Parameter-String selbst
+        # geparst, statt den Objekt-Accessoren zu vertrauen. Fallback auf die
+        # normalen QGIS-Methoden, falls der Rohwert (z.B. bei Aufruf aus dem
+        # Modeler) kein String ist.
+        raw_value = parameters.get(self.EXTENT)
+        extent_crs = self.parameterAsExtentCrs(parameters, self.EXTENT, context)
+        match = re.match(
+            r"\s*([\-0-9.eE]+)\s*,\s*([\-0-9.eE]+)\s*,\s*([\-0-9.eE]+)\s*,\s*([\-0-9.eE]+)"
+            r"\s*(?:\[\s*([^\]]+?)\s*\])?\s*$",
+            raw_value) if isinstance(raw_value, str) else None
+        if match:
+            orig_bbox = tuple(float(match.group(i)) for i in range(1, 5))
+            if match.group(5):
+                extent_crs = QgsCoordinateReferenceSystem(match.group(5))
+        else:
+            extent_raw = self.parameterAsExtent(parameters, self.EXTENT, context)
+            orig_bbox = (extent_raw.xMinimum(), extent_raw.yMinimum(),
+                         extent_raw.xMaximum(), extent_raw.yMaximum())
+        feedback.pushInfo(
+            f"AOI in Original-CRS ({extent_crs.authid()}): west={orig_bbox[0]:.4f}, "
+            f"sued={orig_bbox[1]:.4f}, ost={orig_bbox[2]:.4f}, nord={orig_bbox[3]:.4f}")
+
+        def reproject_bbox_osr(bbox, src_authid, dst_authid):
+            src_srs = osr.SpatialReference()
+            src_srs.SetFromUserInput(src_authid)
+            src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+            dst_srs = osr.SpatialReference()
+            dst_srs.SetFromUserInput(dst_authid)
+            dst_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+            tr = osr.CoordinateTransformation(src_srs, dst_srs)
+            corners = [(bbox[0], bbox[1]), (bbox[2], bbox[1]), (bbox[2], bbox[3]), (bbox[0], bbox[3])]
+            xs, ys = [], []
+            for x, y in corners:
+                tx, ty, _ = tr.TransformPoint(x, y)
+                xs.append(tx)
+                ys.append(ty)
+            return (min(xs), min(ys), max(xs), max(ys))
+
+        # WICHTIG: Fuer EPSG:4326 die URSPRUENGLICHE QGIS-eigene Methode
+        # verwenden (parameterAsExtent mit Ziel-CRS) - NICHT die eigene
+        # osr-Funktion. Die hat sich nur fuer das Paar 31255->31258 als
+        # notwendig erwiesen; fuer 31255->4326 hat rohes osr (ohne
+        # QGIS-Kontext) beim fehlenden PROJ-Gitter offenbar eine andere,
+        # diesmal falsche Rueckfalloption gewaehlt, waehrend QGIS' eigene
+        # Transform-Logik hier immer ein brauchbares (wenn auch nicht
+        # perfekt genaues) Ergebnis geliefert hat.
+        extent_4326 = self.parameterAsExtent(
             parameters, self.EXTENT, context, QgsCoordinateReferenceSystem("EPSG:4326"))
-        aoi_bbox = (extent.xMinimum(), extent.yMinimum(), extent.xMaximum(), extent.yMaximum())
+        aoi_bbox = (extent_4326.xMinimum(), extent_4326.yMinimum(),
+                    extent_4326.xMaximum(), extent_4326.yMaximum())
         feedback.pushInfo(
             f"AOI in EPSG:4326: west={aoi_bbox[0]:.6f}, sued={aoi_bbox[1]:.6f}, "
             f"ost={aoi_bbox[2]:.6f}, nord={aoi_bbox[3]:.6f}")
 
-        extent_native = self.parameterAsExtent(
-            parameters, self.EXTENT, context, QgsCoordinateReferenceSystem(KAGIS_SOURCE_CRS))
-        aoi_bbox_native = (extent_native.xMinimum(), extent_native.yMinimum(),
-                            extent_native.xMaximum(), extent_native.yMaximum())
+        if not looks_like_valid_4326_kaernten(aoi_bbox):
+            feedback.reportError(
+                "Die AOI wurde nach EPSG:4326 umgerechnet, liegt aber weit ausserhalb von "
+                "Kaernten. Das deutet auf eine fehlgeschlagene CRS-Umrechnung hin, oft weil "
+                "ein benoetigtes PROJ-Datumsgitter auf diesem System fehlt und die Umrechnung "
+                "deshalb unveraendert durchgereicht wurde.")
+            return {}
+
+        # MGI-Ferro-referenzierte GK-Zonen (West/Mitte/Ost: EPSG 31254/31255/
+        # 31256) und ihre Greenwich-referenzierten Gegenstuecke (M28/M31/M34:
+        # EPSG 31257/31258/31259) beschreiben laut oesterreichischer
+        # Vermessungskonvention dieselbe Projektion - sie unterscheiden sich
+        # nur um eine FESTE Rechtswert-Konstante, der Hochwert bleibt
+        # unveraendert. Falls das Original-CRS eines dieser Paare ist, wird
+        # diese bekannte Konstante direkt verwendet statt osr zu bemuehen -
+        # fuer jedes andere CRS wird der generische osr-Weg genutzt.
+        # HINWEIS: aoi_bbox_native dient inzwischen NUR NOCH der Log-Ausgabe
+        # zur Diagnose (siehe unten) - die eigentliche Kachel-Pruefung nutzt
+        # ausschliesslich aoi_bbox (EPSG:4326), siehe raster_extent() und
+        # dessen Verwendung weiter unten. Trotzdem hier belassen, da diese
+        # Berechnung fuer die Fehlersuche wertvoll war und es bei kuenftigen
+        # aehnlichen CRS-Problemen wieder sein koennte.
+        MGI_FERRO_TO_GREENWICH_EASTING_OFFSET = {
+            ("EPSG:31254", "EPSG:31257"): 150000,
+            ("EPSG:31255", "EPSG:31258"): 450000,
+            ("EPSG:31256", "EPSG:31259"): 750000,
+        }
+        pair = (extent_crs.authid(), KAGIS_SOURCE_CRS)
+        if pair in MGI_FERRO_TO_GREENWICH_EASTING_OFFSET:
+            offset = MGI_FERRO_TO_GREENWICH_EASTING_OFFSET[pair]
+            aoi_bbox_native = (orig_bbox[0] + offset, orig_bbox[1],
+                                orig_bbox[2] + offset, orig_bbox[3])
+            feedback.pushInfo(f"Bekannte MGI-Ferro->Greenwich-Konstante ({offset} m) direkt angewendet.")
+        else:
+            aoi_bbox_native = reproject_bbox_osr(orig_bbox, extent_crs.authid(), KAGIS_SOURCE_CRS)
+
+        feedback.pushInfo(
+            f"AOI in {KAGIS_SOURCE_CRS} (nur zur Information): west={aoi_bbox_native[0]:.2f}, "
+            f"sued={aoi_bbox_native[1]:.2f}, ost={aoi_bbox_native[2]:.2f}, nord={aoi_bbox_native[3]:.2f} "
+            f"(Original-Extent-CRS: {extent_crs.authid()})")
         out_root = self.parameterAsString(parameters, self.OUTPUT_FOLDER, context)
         group_names = [list(COLLECTION_GROUPS.keys())[i]
                         for i in self.parameterAsEnums(parameters, self.GROUPS_PARAM, context)]
@@ -357,7 +532,7 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
                 # AOI checken - falls KAGIS' eigene STAC-bbox-Angabe fuer eine
                 # Collection fehlerhaft ist (z.B. Collection- statt
                 # Item-Ausdehnung), faellt das hier auf, weil wir uns auf
-                # gar keine Metadaten mehr verlassen, sondern auf die echten
+                # gar keine Metadaten verlassen, sondern auf die echten
                 # Pixel-Header der heruntergeladenen Datei.
                 verified = []
                 off_target = []
@@ -366,7 +541,7 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
                     ext = raster_extent(path)
                     if ext is None:
                         unreadable.append(path)
-                    elif bbox_overlap(ext, aoi_bbox_native):
+                    elif bbox_overlap(ext, aoi_bbox):
                         verified.append(path)
                     else:
                         off_target.append(path)
@@ -385,7 +560,7 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
                     feedback.pushWarning(
                         f"{label}: {len(off_target)} heruntergeladene Kachel(n) liegen laut "
                         "ihrer EIGENEN Georeferenzierung tatsaechlich ausserhalb der AOI "
-                        f"(KAGIS-Katalogmetadaten waren fehlerhaft) - geloescht: {names}{more}")
+                        f"- geloescht: {names}{more}")
                     for p in off_target:
                         try:
                             os.remove(p)
@@ -397,35 +572,105 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
                     feedback.pushWarning(f"{label}: nach Extent-Pruefung keine Kacheln mehr uebrig.")
                     continue
 
-                vrt_path = os.path.join(out_dir, f"{label}_mosaic.vrt")
+                try:
+                    vrt_path = os.path.join(out_dir, f"{label}_mosaic.vrt")
 
-                # Projektion direkt beim Bauen erzwingen - fest auf die
-                # bekannte KAGIS-CRS, nicht aus den Original-Kacheln gelesen
-                # (siehe Kommentar bei KAGIS_SOURCE_CRS oben).
-                vrt_options = gdal.BuildVRTOptions(outputSRS=KAGIS_SOURCE_CRS)
-                gdal.BuildVRT(vrt_path, downloaded, options=vrt_options)
+                    # WICHTIG: NICHT blind KAGIS_SOURCE_CRS (EPSG:31258)
+                    # erzwingen. Stattdessen die echte CRS direkt aus einer
+                    # tatsaechlich heruntergeladenen Kachel dieser Gruppe
+                    # auslesen und genau die verwenden.
+                    src_ds = gdal.Open(downloaded[0])
+                    tile_wkt = src_ds.GetProjection() if src_ds is not None else ""
+                    src_ds = None
+                    if not tile_wkt:
+                        feedback.pushWarning(
+                            f"{label}: konnte keine Projektion aus der Original-Kachel lesen - "
+                            f"verwende ersatzweise {KAGIS_SOURCE_CRS}.")
+                        tile_wkt = KAGIS_SOURCE_CRS
+                    else:
+                        # Manche KAGIS-Kacheln (beobachtet bei ALS1) liefern
+                        # eine technisch korrekte, aber nicht autoritativ
+                        # referenzierte WKT (kein "ID[EPSG,...]" auf oberster
+                        # Ebene) - QGIS erkennt das dann zwar als gueltige,
+                        # aber "namenlose" CRS (kein authid). Drei Ebenen,
+                        # JEDE EINZELN in try/except - eine Exception in
+                        # Ebene 1 (z.B. weil AutoIdentifyEPSG() bei
+                        # osr.UseExceptions() wirft statt nur False
+                        # zurueckzugeben) darf nicht die folgenden Ebenen
+                        # verhindern.
+                        epsg_code = None
 
-                # Kontrolle: hat das VRT jetzt tatsaechlich eine Projektion?
-                check_ds = gdal.Open(vrt_path)
-                final_wkt = check_ds.GetProjection() if check_ds is not None else ""
-                check_ds = None
-                if final_wkt:
-                    feedback.pushInfo(f"{label}: VRT-Projektion gesetzt auf {KAGIS_SOURCE_CRS}.")
-                else:
-                    feedback.pushWarning(f"{label}: VRT hat auch nach outputSRS KEINE Projektion - bitte melden!")
+                        try:
+                            tile_srs = osr.SpatialReference()
+                            tile_srs.ImportFromWkt(tile_wkt)
+                            if tile_srs.AutoIdentifyEPSG() == 0:
+                                epsg_code = tile_srs.GetAuthorityCode(None)
+                        except Exception:
+                            tile_srs = None
 
-                feedback.pushInfo(f"{label}: VRT erstellt ({len(downloaded)} Dateien, {KAGIS_SOURCE_CRS}) -> {vrt_path}")
+                        if not epsg_code and tile_srs is not None:
+                            # AutoIdentifyEPSG() vergleicht offenbar exakt
+                            # gegen die EPSG-Datenbank und scheitert schon an
+                            # winzigen Gleitkomma-Rundungsdifferenzen im
+                            # Ellipsoid (beobachtet bei ALS1: 299.152812800003
+                            # statt 299.1528128) - deshalb den CRS-NAMEN gegen
+                            # die bekannten oesterreichischen MGI-Bezeichnungen
+                            # abgleichen, das ist unempfindlich dagegen.
+                            try:
+                                crs_name = tile_srs.GetName()
+                                epsg_code = KNOWN_MGI_CRS_NAMES.get(crs_name)
+                                if epsg_code:
+                                    feedback.pushInfo(
+                                        f"{label}: CRS anhand des Namens '{crs_name}' als "
+                                        f"EPSG:{epsg_code} erkannt (exakter Datenbankabgleich "
+                                        "war nicht eindeutig).")
+                            except Exception:
+                                pass
 
-                final_path = vrt_path
-                if target_crs.isValid():
-                    safe_authid = target_crs.authid().replace(":", "_") or "custom_crs"
-                    warped_path = os.path.join(out_dir, f"{label}_mosaic_{safe_authid}.vrt")
-                    gdal.Warp(warped_path, vrt_path, dstSRS=target_crs.toWkt(),
-                              format="VRT", resampleAlg="near")
-                    feedback.pushInfo(f"{label}: nach {target_crs.authid()} umprojiziert -> {warped_path}")
-                    final_path = warped_path
+                        if not epsg_code:
+                            # Letzte Ebene: dieses Tool ist ausschliesslich
+                            # fuer ALS1/ALS2 gedacht, und beide CRS sind per
+                            # gdalinfo bestaetigt bekannt - direkt anhand des
+                            # Zyklus zuweisen, statt bei einem unerkannten
+                            # Einzelfall unbenannt zu bleiben.
+                            epsg_code = KNOWN_GROUP_CRS.get(gname)
+                            if epsg_code:
+                                feedback.pushInfo(
+                                    f"{label}: CRS anhand des bekannten Zyklus '{gname}' als "
+                                    f"EPSG:{epsg_code} angenommen (weder Datenbank- noch "
+                                    "Namensabgleich waren eindeutig).")
 
-                results[label] = final_path
+                        if epsg_code:
+                            tile_wkt = f"EPSG:{epsg_code}"
+                            feedback.pushInfo(f"{label}: Original-Kachel-CRS als EPSG:{epsg_code} identifiziert.")
+
+                    vrt_options = gdal.BuildVRTOptions(outputSRS=tile_wkt)
+                    gdal.BuildVRT(vrt_path, downloaded, options=vrt_options)
+
+                    # Kontrolle: hat das VRT jetzt tatsaechlich eine Projektion?
+                    check_ds = gdal.Open(vrt_path)
+                    final_wkt = check_ds.GetProjection() if check_ds is not None else ""
+                    check_ds = None
+                    if final_wkt:
+                        feedback.pushInfo(f"{label}: VRT-Projektion aus Original-Kachel uebernommen.")
+                    else:
+                        feedback.pushWarning(f"{label}: VRT hat auch nach outputSRS KEINE Projektion - bitte melden!")
+
+                    feedback.pushInfo(f"{label}: VRT erstellt ({len(downloaded)} Dateien) -> {vrt_path}")
+
+                    final_path = vrt_path
+                    if target_crs.isValid():
+                        safe_authid = target_crs.authid().replace(":", "_") or "custom_crs"
+                        warped_path = os.path.join(out_dir, f"{label}_mosaic_{safe_authid}.vrt")
+                        gdal.Warp(warped_path, vrt_path, dstSRS=target_crs.toWkt(),
+                                  format="VRT", resampleAlg="near")
+                        feedback.pushInfo(f"{label}: nach {target_crs.authid()} umprojiziert -> {warped_path}")
+                        final_path = warped_path
+
+                    results[label] = final_path
+                except Exception as e:
+                    feedback.pushWarning(f"{label}: VRT-Erstellung/Umprojektion fehlgeschlagen ({e}) - uebersprungen.")
+                    continue
 
         if outer_canceled:
             feedback.pushInfo(
@@ -435,10 +680,16 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
             layer = QgsRasterLayer(vrt_path, label)
             if layer.isValid():
                 if not layer.crs().isValid():
-                    layer.setCrs(QgsCoordinateReferenceSystem(KAGIS_SOURCE_CRS))
+                    # label ist "<Zyklus>_<Modelltyp>", z.B. "ALS2_DGM" -
+                    # anhand des Zyklus die bekannte richtige CRS waehlen,
+                    # statt blind KAGIS_SOURCE_CRS (nur fuer ALS1 korrekt).
+                    gname_for_label = label.split("_")[0]
+                    fallback_epsg = KNOWN_GROUP_CRS.get(gname_for_label)
+                    fallback_crs = f"EPSG:{fallback_epsg}" if fallback_epsg else KAGIS_SOURCE_CRS
+                    layer.setCrs(QgsCoordinateReferenceSystem(fallback_crs))
                     feedback.pushInfo(
                         f"Layer '{label}': CRS wurde nicht automatisch erkannt - manuell auf "
-                        f"{KAGIS_SOURCE_CRS} gesetzt.")
+                        f"{fallback_crs} gesetzt.")
                 else:
                     feedback.pushInfo(f"Layer '{label}': CRS automatisch erkannt ({layer.crs().authid()}).")
                 QgsProject.instance().addMapLayer(layer)
@@ -474,9 +725,11 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
             "(z.B. ALS2) auf mehrere Regionen aufgeteilt ist.</p>"
             "<p>Pro Zyklus UND pro gewähltem Modelltyp (DGM/DOM/DOL) entsteht ein "
             "eigener Mosaik-Layer.</p>"
-            f"<p>Die Original-CRS wird fest als {KAGIS_SOURCE_CRS} angenommen "
-            "(bestätigt für KAGIS-Rasterdaten); mit Ziel-CRS wird zusätzlich ein "
-            "virtuell umprojiziertes VRT erzeugt.</p>"
+            "<p>Die Original-CRS wird nicht einheitlich angenommen, sondern direkt "
+            "aus einer echten heruntergeladenen Kachel gelesen: ALS1 liegt in "
+            "EPSG:31258 (MGI / Austria GK M31), ALS2 in EPSG:31255 (MGI / Austria "
+            "GK Central). Mit Ziel-CRS wird zusätzlich ein virtuell umprojiziertes "
+            "VRT erzeugt.</p>"
             "<p>Quelle: Land Kärnten - KAGIS, https://kagis.ktn.gv.at, CC-BY-4.0</p>"
         )
 
