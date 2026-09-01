@@ -4,7 +4,7 @@ A QGIS Processing script that bulk-downloads elevation raster tiles (DGM/DOM/DOL
 
 > **Note:** The tool's interface (parameter labels, log messages, help text) is in German, matching its target audience and the German-language KAGIS data catalog it queries. This README is in English for discoverability.
 
-[![Screenshot of the tool in QGIS](https://github.com/preinzi/qgis-kagis-hoehendaten-download/raw/main/images/screenshot.png)](/preinzi/qgis-kagis-hoehendaten-download/blob/main/images/screenshot.png)
+<img src="images/screenshot.png" width="400" alt="Screenshot of the tool in QGIS">
 
 ## What it does
 
