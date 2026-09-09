@@ -40,7 +40,7 @@ No extra Python packages required beyond what ships with QGIS (uses only the Pyt
 | **Gebiet (AOI)**  | Area of interest — draw a rectangle, use the current canvas extent or calculate extent from a layer                                                                                                      |
 | **ALS-Zyklen**    | Which survey cycle(s) to fetch: ALS1, ALS2, or both                                                                                                                                                      |
 | **Modelltyp(en)** | Which elevation model(s) to fetch: DGM, DOM, and/or DOL                                                                                                                                                  |
-| **Ziel-CRS**      | Optional. Leave empty to keep each tile's own original CRS (ALS1=EPSG:31258, ALS2=EPSG:31255); pick a CRS to get an additional, virtually reprojected VRT                                                |
+| **Ziel-CRS**      | Optional. Leave empty to keep each tile's own original CRS (ALS1=EPSG:31258, ALS2=EPSG:31255); pick a CRS to get an additional, virtually reprojected VRT; resampling-method is cubic                    |
 | **Zielordner**    | Where downloaded tiles and mosaics are stored. It is recommended to use a persistent folder, not the default temp location — results should stay usable after the QGIS session ends, and a later run over an overlapping area reuses already-downloaded tiles instead of re-fetching them |
 
 ### Output layers
