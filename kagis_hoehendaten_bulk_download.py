@@ -663,7 +663,7 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
                         safe_authid = target_crs.authid().replace(":", "_") or "custom_crs"
                         warped_path = os.path.join(out_dir, f"{label}_mosaic_{safe_authid}.vrt")
                         gdal.Warp(warped_path, vrt_path, dstSRS=target_crs.toWkt(),
-                                  format="VRT", resampleAlg="near")
+                                  format="VRT", resampleAlg="cubic")
                         feedback.pushInfo(f"{label}: nach {target_crs.authid()} umprojiziert -> {warped_path}")
                         final_path = warped_path
 
