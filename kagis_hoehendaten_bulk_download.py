@@ -18,6 +18,7 @@ nämlich ALS1 in EPSG:31258 (MGI / Austria GK M31) und ALS2 in EPSG:31255
 import json
 import os
 import re
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -25,12 +26,12 @@ from urllib.request import Request, urlopen
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsProcessingAlgorithm,
+    QgsProcessingContext,
+    QgsProcessingParameterBoolean,
     QgsProcessingParameterCrs,
     QgsProcessingParameterEnum,
     QgsProcessingParameterExtent,
     QgsProcessingParameterFolderDestination,
-    QgsProject,
-    QgsRasterLayer,
 )
 from osgeo import gdal, osr
 
@@ -89,6 +90,109 @@ ASSET_TYPES = {
     "DOM": ["dom"],
     "DOL": ["dol"],
 }
+
+
+def robust_replace(src, dst, feedback=None, retries=5, delay=1.5):
+    """os.replace() mit Wiederholung bei transienten Windows-Dateisperren
+    (z.B. Virenscanner direkt nach dem Schreiben einer frischen Datei) -
+    identisches Muster wie im BEV-Orthofoto-Tool, wo genau das wiederholt
+    zu Fehlern gefuehrt hat."""
+    for attempt in range(retries):
+        if not os.path.exists(src) and os.path.exists(dst):
+            return True
+        try:
+            os.replace(src, dst)
+            return True
+        except (PermissionError, FileNotFoundError):
+            if os.path.exists(dst) and not os.path.exists(src):
+                return True
+            if attempt == retries - 1:
+                return False
+            if feedback is not None:
+                feedback.pushInfo(f"{os.path.basename(dst)}: Datei kurz gesperrt, versuche erneut ...")
+            time.sleep(delay)
+    return False
+
+
+def unique_path(path):
+    """Haengt bei Bedarf _1, _2, ... an, damit eine bereits vorhandene
+    Datei nie ungefragt ueberschrieben wird."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    i = 1
+    while os.path.exists(f"{base}_{i}{ext}"):
+        i += 1
+    return f"{base}_{i}{ext}"
+
+
+class gdal_error_capture:
+    """Sammelt GDALs interne CPL-Fehler-/Warnmeldungen waehrend eines
+    Aufrufs. Noetig, weil gdal.BuildVRT() bekanntermassen KEINE
+    zuverlaessige Python-Exception wirft, selbst mit UseExceptions() -
+    z.B. eine problematische Quelldatei wird nur als Warnung gemeldet und
+    dann stillschweigend uebersprungen (siehe github.com/OSGeo/gdal/
+    issues/4755). Ohne diesen Handler blieb ein solcher Fall beim
+    BEV-Orthofoto-Tool lange unsichtbar."""
+
+    def __init__(self):
+        self.messages = []
+
+    def _handler(self, err_class, err_num, err_msg):
+        self.messages.append(err_msg)
+
+    def __enter__(self):
+        gdal.PushErrorHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc_info):
+        gdal.PopErrorHandler()
+
+
+def add_overviews(path, feedback=None):
+    """Baut interne Pyramiden-Ebenen fuer schnelleres Anzeigen in QGIS.
+    Kein kritischer Fehler, falls das fehlschlaegt."""
+    try:
+        ds = gdal.Open(path, gdal.GA_Update)
+        if ds is not None:
+            ds.BuildOverviews("AVERAGE", [2, 4, 8, 16, 32])
+        ds = None
+    except Exception as e:
+        if feedback is not None:
+            feedback.pushInfo(f"{os.path.basename(path)}: Pyramiden-Erstellung fehlgeschlagen ({e}) - nicht kritisch.")
+
+
+def fix_south_up(paths, cache_dir, feedback=None):
+    """Prueft jede Datei auf 'Sueden-oben'-Ausrichtung (positive Y-
+    Aufloesung) und ersetzt sie bei Bedarf durch eine per gdal.Warp
+    normalisierte Kopie - gdalbuildvrt kann solche Dateien nicht
+    verarbeiten und uebersprang sie beim BEV-Orthofoto-Tool bisher
+    stillschweigend (dort urspruengliche Ursache eines lange unklaren
+    VRT-Fehlschlags). Bei KAGIS bisher nicht beobachtet, aber derselbe
+    gdalbuildvrt-Aufruf koennte grundsaetzlich genauso betroffen sein."""
+    fixed = []
+    for path in paths:
+        try:
+            ds = gdal.Open(path)
+            gt = ds.GetGeoTransform()
+            ds = None
+        except Exception:
+            fixed.append(path)
+            continue
+        if gt[5] <= 0:
+            fixed.append(path)
+            continue
+        if feedback is not None:
+            feedback.pushInfo(f"{os.path.basename(path)}: 'Süden-oben' ausgerichtet - normalisiere ...")
+        os.makedirs(cache_dir, exist_ok=True)
+        norm_path = os.path.join(cache_dir, f"normalized_{os.path.basename(path)}")
+        try:
+            gdal.Warp(norm_path, path, format="GTiff")
+            fixed.append(norm_path)
+        except Exception as e:
+            if feedback is not None:
+                feedback.pushWarning(f"{os.path.basename(path)}: Normalisierung fehlgeschlagen ({e}) - übersprungen.")
+    return fixed
 
 
 def fetch_json(url):
@@ -238,7 +342,8 @@ def download_item_assets(item, out_dir, asset_key_filter, feedback=None):
                         if not chunk:
                             break
                         f.write(chunk)
-                os.replace(tmp_path, out_path)  # atomar - out_path existiert erst jetzt
+                if not robust_replace(tmp_path, out_path, feedback=feedback):
+                    continue
                 ok = True
                 break
             except Exception:
@@ -310,6 +415,7 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
     GROUPS_PARAM = "GROUPS_PARAM"
     ASSET_TYPES_PARAM = "ASSET_TYPES_PARAM"
     TARGET_CRS = "TARGET_CRS"
+    BUILD_OVERVIEWS = "BUILD_OVERVIEWS"
 
     def initAlgorithm(self, config=None):
         self.addParameter(QgsProcessingParameterExtent(self.EXTENT, "Gebiet (AOI)"))
@@ -324,6 +430,9 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
             "Ziel-CRS (leer lassen = jeweilige Original-CRS der Kacheln, "
             "ALS1=EPSG:31258, ALS2=EPSG:31255)",
             optional=True))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.BUILD_OVERVIEWS, "Pyramiden (Übersichtsebenen) für schnelleres Anzeigen erstellen",
+            defaultValue=True))
         self.addParameter(QgsProcessingParameterFolderDestination(self.OUTPUT_FOLDER, "Zielordner"))
 
     def processAlgorithm(self, parameters, context, feedback):
@@ -435,6 +544,7 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
         asset_type_names = [list(ASSET_TYPES.keys())[i]
                              for i in self.parameterAsEnums(parameters, self.ASSET_TYPES_PARAM, context)]
         target_crs = self.parameterAsCrs(parameters, self.TARGET_CRS, context)
+        build_overviews = self.parameterAsBoolean(parameters, self.BUILD_OVERVIEWS, context)
 
         feedback.pushInfo(f"Lade Collection-Liste von {API_ROOT}collections ...")
         all_collections = list_collections(feedback=feedback)
@@ -572,8 +682,14 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
                     feedback.pushWarning(f"{label}: nach Extent-Pruefung keine Kacheln mehr uebrig.")
                     continue
 
+                # Vorsorglich auf "Sueden-oben"-Ausrichtung pruefen - siehe
+                # fix_south_up()-Docstring fuer den Hintergrund. Bei KAGIS
+                # bisher nicht beobachtet, aber derselbe gdalbuildvrt-Aufruf
+                # koennte grundsaetzlich genauso betroffen sein.
+                downloaded = fix_south_up(downloaded, os.path.join(out_dir, "_normalized"), feedback=feedback)
+
                 try:
-                    vrt_path = os.path.join(out_dir, f"{label}_mosaic.vrt")
+                    vrt_path = unique_path(os.path.join(out_dir, f"{label}_mosaic.vrt"))
 
                     # WICHTIG: NICHT blind KAGIS_SOURCE_CRS (EPSG:31258)
                     # erzwingen. Stattdessen die echte CRS direkt aus einer
@@ -645,7 +761,10 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
                             feedback.pushInfo(f"{label}: Original-Kachel-CRS als EPSG:{epsg_code} identifiziert.")
 
                     vrt_options = gdal.BuildVRTOptions(outputSRS=tile_wkt)
-                    gdal.BuildVRT(vrt_path, downloaded, options=vrt_options)
+                    with gdal_error_capture() as cap:
+                        gdal.BuildVRT(vrt_path, downloaded, options=vrt_options)
+                    for msg in cap.messages:
+                        feedback.pushWarning(f"{label}: GDAL meldete beim VRT-Bau: {msg}")
 
                     # Kontrolle: hat das VRT jetzt tatsaechlich eine Projektion?
                     check_ds = gdal.Open(vrt_path)
@@ -661,12 +780,14 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
                     final_path = vrt_path
                     if target_crs.isValid():
                         safe_authid = target_crs.authid().replace(":", "_") or "custom_crs"
-                        warped_path = os.path.join(out_dir, f"{label}_mosaic_{safe_authid}.vrt")
+                        warped_path = unique_path(os.path.join(out_dir, f"{label}_mosaic_{safe_authid}.vrt"))
                         gdal.Warp(warped_path, vrt_path, dstSRS=target_crs.toWkt(),
                                   format="VRT", resampleAlg="cubic")
                         feedback.pushInfo(f"{label}: nach {target_crs.authid()} umprojiziert -> {warped_path}")
                         final_path = warped_path
 
+                    if build_overviews:
+                        add_overviews(final_path, feedback=feedback)
                     results[label] = final_path
                 except Exception as e:
                     feedback.pushWarning(f"{label}: VRT-Erstellung/Umprojektion fehlgeschlagen ({e}) - uebersprungen.")
@@ -676,26 +797,10 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
             feedback.pushInfo(
                 f"Abgebrochen - {len(results)} bereits vollstaendig heruntergeladene Layer werden trotzdem hinzugefuegt.")
 
-        for label, vrt_path in results.items():
-            layer = QgsRasterLayer(vrt_path, label)
-            if layer.isValid():
-                if not layer.crs().isValid():
-                    # label ist "<Zyklus>_<Modelltyp>", z.B. "ALS2_DGM" -
-                    # anhand des Zyklus die bekannte richtige CRS waehlen,
-                    # statt blind KAGIS_SOURCE_CRS (nur fuer ALS1 korrekt).
-                    gname_for_label = label.split("_")[0]
-                    fallback_epsg = KNOWN_GROUP_CRS.get(gname_for_label)
-                    fallback_crs = f"EPSG:{fallback_epsg}" if fallback_epsg else KAGIS_SOURCE_CRS
-                    layer.setCrs(QgsCoordinateReferenceSystem(fallback_crs))
-                    feedback.pushInfo(
-                        f"Layer '{label}': CRS wurde nicht automatisch erkannt - manuell auf "
-                        f"{fallback_crs} gesetzt.")
-                else:
-                    feedback.pushInfo(f"Layer '{label}': CRS automatisch erkannt ({layer.crs().authid()}).")
-                QgsProject.instance().addMapLayer(layer)
-                feedback.pushInfo(f"Layer '{label}' zum Projekt hinzugefuegt.")
-            else:
-                feedback.pushWarning(f"Layer '{label}' konnte nicht geladen werden: {vrt_path}")
+        for label, path in results.items():
+            context.addLayerToLoadOnCompletion(
+                path, QgsProcessingContext.LayerDetails(label, context.project(), label))
+            feedback.pushInfo(f"Layer '{label}' zum Laden vorgemerkt -> {path}")
 
         summary = f"Fertig: {len(results)} Layer hinzugefuegt."
         if total_failed:
@@ -713,10 +818,10 @@ class KagisBulkDownload(QgsProcessingAlgorithm):
         return "KAGIS Höhendaten Bulk-Download"
 
     def group(self):
-        return "KAGIS"
+        return "LiberGIS"
 
     def groupId(self):
-        return "kagis"
+        return "libergis"
 
     def shortHelpString(self):
         return (
